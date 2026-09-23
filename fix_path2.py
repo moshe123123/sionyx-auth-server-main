@@ -1,0 +1,5 @@
+﻿content = open('index.js', encoding='utf-8').read()
+content = content.replace("await dbSet('organizations/sionov/users/' + user.uid + '/phoneVerified', true);", "await dbSet('users/' + user.uid + '/phoneVerified', true);")
+content = content.replace("await dbSet('organizations/sionov/users/' + user.uid + '/phoneVerifiedAt'", "await dbSet('users/' + user.uid + '/phoneVerifiedAt'")
+open('index.js', 'w', encoding='utf-8').write(content)
+print('OK')

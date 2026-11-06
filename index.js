@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const express = require('express');
 const axios = require('axios');
 const admin = require('firebase-admin');
@@ -70,21 +71,74 @@ async function dbSet(p, data) {
   }
 }
 
-async function findUserByPhone(phone) {
-  const cleanPhone = phone.replace(/\D/g, '');
-  const search = (users, path) => {
-    if (!users) return null;
-    const uid = Object.keys(users).find(key => {
-      const userPhone = (users[key].phoneNumber || '').replace(/\D/g, '');
-      return userPhone === cleanPhone || userPhone.endsWith(cleanPhone) || cleanPhone.endsWith(userPhone);
-    });
-    return uid ? { uid, _path: path, ...users[uid] } : null;
-  };
-  const u1 = await dbGet('users');
-  const r1 = search(u1, 'users');
-  if (r1) return r1;
-  const u2 = await dbGet('organizations/sionov/users');
-  return search(u2, 'organizations/sionov/users');
+// ---- phone handling -------------------------------------------------------
+// The Firebase Auth login of every SIONYX user is "<digits>@sionyx.app" (same rule as the
+// kiosk and the Cloud Functions), so the account is found by an EXACT email match - no more
+// endsWith() guessing that could hit another person's account.
+function digitsOnly(raw) { return String(raw || '').replace(/\D/g, ''); }
+function normalizePhone(raw) {
+  const d = digitsOnly(raw);
+  return d.startsWith('972') ? '0' + d.slice(3) : d;
+}
+function maskPhone(raw) {
+  const d = digitsOnly(raw);
+  return d.length > 4 ? d.slice(0, 3) + '***' + d.slice(-2) : '***';
+}
+function phoneCandidates(raw) {
+  return [...new Set([normalizePhone(raw), digitsOnly(raw)].filter(Boolean))];
+}
+
+async function findAuthUser(rawPhone) {
+  for (const c of phoneCandidates(rawPhone)) {
+    try {
+      const u = await admin.auth().getUserByEmail(c + '@sionyx.app');
+      return { uid: u.uid, phone: c };
+    } catch (e) {
+      if (e.code !== 'auth/user-not-found') throw e;
+    }
+  }
+  return null;
+}
+
+// Organization ids (shallow read - never downloads the users of every store).
+let _orgIdCache = { at: 0, ids: [] };
+async function listOrgIds() {
+  if (Date.now() - _orgIdCache.at < 60 * 1000) return _orgIdCache.ids;
+  const cred = admin.app().options.credential;
+  const { access_token } = await cred.getAccessToken();
+  const base = String(process.env.FIREBASE_DATABASE_URL).replace(/\/$/, '');
+  const res = await axios.get(base + '/organizations.json', {
+    params: { shallow: true },
+    headers: { Authorization: 'Bearer ' + access_token },
+    timeout: 10000
+  });
+  const ids = Object.keys(res.data || {});
+  _orgIdCache = { at: Date.now(), ids };
+  return ids;
+}
+
+// Every place where this account has a user record: one per organization it belongs to,
+// plus the legacy root "users" node if it still exists.
+async function findUserRecords(uid) {
+  const records = [];
+  for (const orgId of await listOrgIds()) {
+    const v = await dbGet('organizations/' + orgId + '/users/' + uid);
+    if (v) records.push({ orgId, path: 'organizations/' + orgId + '/users/' + uid });
+  }
+  const legacy = await dbGet('users/' + uid);
+  if (legacy) records.push({ orgId: null, path: 'users/' + uid });
+  return records;
+}
+
+// At most 3 password resets per phone per hour (in-memory; single Railway instance).
+const _resetLog = new Map();
+function allowReset(phone) {
+  const now = Date.now();
+  const recent = (_resetLog.get(phone) || []).filter(t => now - t < 60 * 60 * 1000);
+  if (recent.length >= 3) { _resetLog.set(phone, recent); return false; }
+  recent.push(now);
+  _resetLog.set(phone, recent);
+  return true;
 }
 
 const TEXTS = {
@@ -93,7 +147,8 @@ const TEXTS = {
   '002': 'מספר לא נמצא במערכת',
   '003': 'שגיאה נסה שנית',
   '004': 'הסיסמה החדשה שלך היא',
-  '005': 'לחזרה הקישו כוכבית'
+  '005': 'לחזרה הקישו כוכבית',
+  '006': 'בוצעו יותר מדי בקשות נסה שוב מאוחר יותר'
 };
 
 function msg(name) {
@@ -104,7 +159,7 @@ const yemotRouter = YemotRouter({ printLog: true });
 
 yemotRouter.get('/yemot', async (call) => {
   const phone = call.phone;
-  console.log('[yemot] call from: ' + phone);
+  console.log('[yemot] call from: ' + maskPhone(phone));
 
   try {
     const digit = await call.read(
@@ -114,48 +169,53 @@ yemotRouter.get('/yemot', async (call) => {
     );
 
     if (digit === '1') {
-      console.log('[yemot] verify: ' + phone);
-      const user = await findUserByPhone(phone);
-      if (!user) {
-        console.log('[yemot] not found: ' + phone);
+      console.log('[yemot] verify: ' + maskPhone(phone));
+      const found = await findAuthUser(phone);
+      const records = found ? await findUserRecords(found.uid) : [];
+      if (!found || !records.length) {
+        console.log('[yemot] not found: ' + maskPhone(phone));
         await call.read([msg('002')], 'tap', { max_digits: 1, sec_wait: 5, allow_empty: true });
         return;
       }
-      await dbSet('users/' + user.uid + '/phoneVerified', true);
-      await dbSet('users/' + user.uid + '/phoneVerifiedAt', new Date().toISOString());
-      console.log('[yemot] verified: ' + user.uid);
+      const now = new Date().toISOString();
+      // The same verification applies to every organization this account belongs to
+      // (one global account per phone).
+      for (const r of records) {
+        await admin.database().ref(r.path).update({ phoneVerified: true, phoneVerifiedAt: now });
+      }
+      await dbSet('phoneVerifications/' + found.phone, {
+        uid: found.uid,
+        verifiedAt: now,
+        orgIds: records.map(r => r.orgId).filter(Boolean)
+      });
+      console.log('[yemot] verified: ' + found.uid + ' in ' + records.length + ' place(s)');
       await call.read([msg('001')], 'tap', { max_digits: 1, sec_wait: 5, allow_empty: true });
 
     } else if (digit === '2') {
-      console.log('[yemot] reset: ' + phone);
-      let user;
-      try { user = await findUserByPhone(phone); } catch(fe) { console.error('[yemot] findUser error:', fe.message); }
-      console.log('[yemot] reset user found:', user ? user.uid : 'null');
-      if (!user) {
+      console.log('[yemot] reset: ' + maskPhone(phone));
+      const found = await findAuthUser(phone);
+      if (!found) {
         await call.read([msg('002')], 'tap', { max_digits: 1, sec_wait: 5, allow_empty: true });
         return;
       }
-      const tempPassword = Math.floor(100000 + Math.random() * 900000).toString();
-      console.log('[yemot] password for ' + user.uid + ': ' + tempPassword);
-      try {
-        await admin.auth().updateUser(user.uid, { password: tempPassword });
-        console.log('[yemot] firebase auth password updated for ' + user.uid);
-      } catch(ae) {
-        console.error('[yemot] auth update error:', ae.message);
+      if (!allowReset(found.phone)) {
+        console.warn('[yemot] reset rate-limited: ' + maskPhone(phone));
+        await call.read([msg('006')], 'tap', { max_digits: 1, sec_wait: 5, allow_empty: true });
+        return;
       }
-      await dbSet((user._path||'users') + '/' + user.uid + '/passwordReset', {
-        tempPassword,
-        expiresAt: Date.now() + 10 * 60 * 1000,
-        createdAt: new Date().toISOString()
-      });
-      await dbSet('organizations/sionov/passwordResets/' + user.uid, {
-        tempPassword,
-        expiresAt: Date.now() + 10 * 60 * 1000,
-        createdAt: new Date().toISOString()
-      });
-      const digits = tempPassword.split('');
+      // Cryptographically random, never logged and never stored in the database.
+      const tempPassword = String(crypto.randomInt(10000000, 100000000));
+      try {
+        await admin.auth().updateUser(found.uid, { password: tempPassword });
+      } catch (ae) {
+        // Do NOT read out a password that was not actually set.
+        console.error('[yemot] auth update error: ' + ae.message);
+        await call.read([msg('003')], 'tap', { max_digits: 1, sec_wait: 5, allow_empty: true });
+        return;
+      }
+      await admin.database().ref('passwordResetLog/' + found.uid).push({ at: new Date().toISOString(), via: 'ivr' });
       const numTexts = { '0':'אפס','1':'אחד','2':'שניים','3':'שלוש','4':'ארבע','5':'חמש','6':'שש','7':'שבע','8':'שמונה','9':'תשע' };
-      const numMsgs = digits.map(d => ({ type: 'text', data: numTexts[d] }));
+      const numMsgs = tempPassword.split('').map(d => ({ type: 'text', data: numTexts[d] }));
       await call.read(
         [msg('004'), ...numMsgs, msg('005')],
         'tap',
